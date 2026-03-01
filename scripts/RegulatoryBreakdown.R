@@ -29,7 +29,21 @@
 is_interactive_rstudio <- function() {
   interactive() && requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()
 }
+safe_slug <- function(x) {
+  x <- trimws(x)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)   # non-alnum -> _
+  x <- gsub("^_+|_+$", "", x)          # trim underscores
+  x <- substr(x, 1, 80)               # keep reasonable length
+  if (!nzchar(x)) x <- "run"
+  x
+}
 
+get_repoish_root <- function() {
+  # If inside a git repo, use git root; else fall back to getwd()
+  out <- tryCatch(system("git rev-parse --show-toplevel", intern = TRUE), error = function(e) character(0))
+  if (length(out) == 0 || !nzchar(out[1])) return(normalizePath(getwd(), winslash = "/", mustWork = TRUE))
+  normalizePath(out[1], winslash = "/", mustWork = TRUE)
+}
 pick_file <- function(prompt = "Select a file") {
   cat("\n", prompt, "\n", sep = "")
   if (is_interactive_rstudio()) {
@@ -78,6 +92,31 @@ capture_script_identity <- function(verbose = TRUE) {
       script_full <- normalizePath(ctx$path, winslash = "/", mustWork = TRUE)
     }
   }
+  # ------------------------------------------------
+  # Capture Git repository metadata
+  # ------------------------------------------------
+  get_git_info <- function() {
+    
+    git_safe <- function(cmd) {
+      out <- tryCatch(system(cmd, intern = TRUE), error = function(e) NA)
+      if (length(out) == 0) return(NA)
+      out
+    }
+    
+    repo_root  <- git_safe("git rev-parse --show-toplevel")
+    branch     <- git_safe("git rev-parse --abbrev-ref HEAD")
+    commit     <- git_safe("git rev-parse HEAD")
+    remote_url <- git_safe("git config --get remote.origin.url")
+    
+    list(
+      repo_root = repo_root,
+      git_branch = branch,
+      git_commit = commit,
+      git_remote = remote_url
+    )
+  }
+  
+  git_meta <- get_git_info()
   
   # 2) Rscript invocation
   if (is.na(script_full)) {
@@ -102,7 +141,12 @@ capture_script_identity <- function(verbose = TRUE) {
     cat("[script_full] ", script_full, "\n", sep = "")
   }
   
-  list(script_name = script_name, script_path = script_path, script_full = script_full)
+  list(
+    script_name = script_name,
+    script_path = script_path,
+    script_full = script_full,
+    git_meta    = git_meta
+  )
 }
 
 # -----------------------------
@@ -134,14 +178,35 @@ meta <- capture_script_identity(verbose = TRUE)
 script_name <- meta$script_name
 script_path <- meta$script_path
 script_full <- meta$script_full
+git_meta    <- meta$git_meta
 
 timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
 timestamp_tag <- format(Sys.time(), "%Y%m%d_%H%M%S")
 
-# Output directory (normalized, exists)
-output_dir <- pick_dir("Select OUTPUT directory (all files + HTML will be written here)")
-if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+# ============================================================
+# Output directory standardization
+#   Always create outputs/<run_name>_<timestamp>/
+# ============================================================
+
+# Determine repository or working root
+root_dir <- get_repoish_root()
+
+# Base outputs directory
+outputs_base <- file.path(root_dir, "outputs")
+if (!dir.exists(outputs_base)) dir.create(outputs_base, recursive = TRUE, showWarnings = FALSE)
+
+# Ask user for run name
+cat("\nEnter a run name (e.g. DTW_RegulatoryLandscape, Rev1_Fig2, etc.)\n")
+run_name <- safe_slug(readline("run_name: "))
+
+# Create run-specific folder
+run_folder <- paste0(run_name, "_", timestamp_tag)
+
+output_dir <- file.path(outputs_base, run_folder)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 output_dir <- normalizePath(output_dir, winslash = "/", mustWork = TRUE)
+
+cat("\n[output_dir ABSOLUTE]\n", output_dir, "\n", sep = "")
 
 # Ask if integrated summary table exists
 cat("\nDo you already have the integrated summary table (Liver_Regulatory_Summary_Table.csv)?\n")
@@ -237,10 +302,12 @@ if (has_integrated == "Y") {
   dtw <- read_csv(dtw_assign_path); require_cols(dtw, c("Gene", "Cluster"), "DTW assignments")
   
   pca <- read_csv(pca_path); require_cols(pca, c("Gene", "PC1", "PC2"), "PCA loadings")
-  pca_sum <- aggregate(cbind(PC1, PC2) ~ Gene, data = pca, FUN = function(x) c(mean = mean(x), max = max(x)))
+  # FIX 1/2: PC1_max and PC2_max should be maximum ABSOLUTE loading across windows
+  pca_sum <- aggregate(cbind(PC1, PC2) ~ Gene, data = pca,
+                       FUN = function(x) c(mean = mean(x), maxabs = max(abs(x))))
   # pca_sum has matrix columns; expand
-  PC1_mean <- pca_sum$PC1[, "mean"]; PC1_max <- pca_sum$PC1[, "max"]
-  PC2_mean <- pca_sum$PC2[, "mean"]; PC2_max <- pca_sum$PC2[, "max"]
+  PC1_mean <- pca_sum$PC1[, "mean"]; PC1_max <- pca_sum$PC1[, "maxabs"]
+  PC2_mean <- pca_sum$PC2[, "mean"]; PC2_max <- pca_sum$PC2[, "maxabs"]
   pca_summary <- data.frame(Gene = pca_sum$Gene, PC1_mean = PC1_mean, PC1_max = PC1_max,
                             PC2_mean = PC2_mean, PC2_max = PC2_max, stringsAsFactors = FALSE)
   
@@ -400,12 +467,10 @@ save_png(p_dtw, expr = {
        xlab = "PCA Coordination Strength (max |PC1_max| or |PC2_max|)",
        ylab = "Variance Restructuring (Levene_F)",
        main = "Regulatory Landscape Colored by DTW Trajectory Cluster")
-  # Use default palette without hardcoding specific colors
-  pal <- seq_along(cl)
-  for (i in seq_along(cl)) {
-    idx <- integrated$Cluster == cl[i]
-    points(integrated$PCA_strength[idx], integrated$Levene_F[idx], pch = 16)
-  }
+  # FIX 2/2: actually color points by DTW cluster (base R palette)
+  cl_factor <- factor(integrated$Cluster, levels = cl)
+  cols <- as.integer(cl_factor)
+  points(integrated$PCA_strength, integrated$Levene_F, pch = 16, col = cols)
   abline(v = pc_thresh)
   abline(h = lev_thresh)
   points(drivers_for_plot$PCA_strength, drivers_for_plot$Levene_F, pch = 23, cex = 1.1)
@@ -414,7 +479,7 @@ save_png(p_dtw, expr = {
          pos = 4, cex = 0.7)
   }
   legend("topleft", legend = paste0("DTW Cluster ", cl),
-         pch = 16, bty = "n")
+         pch = 16, col = seq_along(cl), bty = "n")
 })
 
 # 3) Numbered plot + key
@@ -436,10 +501,10 @@ make_numbered_plot <- function() {
        ylab = "Variance Restructuring (Levene_F)",
        main = "Regulatory Landscape (Numbered Points) — see Key CSV")
   cl <- sort(unique(num_df$Cluster))
-  for (i in seq_along(cl)) {
-    idx <- num_df$Cluster == cl[i]
-    points(num_df$PCA_strength[idx], num_df$Levene_F[idx], pch = 16)
-  }
+  # FIX 2/2 continued: color points by cluster in numbered plot as well
+  cl_factor <- factor(num_df$Cluster, levels = cl)
+  cols <- as.integer(cl_factor)
+  points(num_df$PCA_strength, num_df$Levene_F, pch = 16, col = cols)
   abline(v = pc_thresh)
   abline(h = lev_thresh)
   # Annotate every point
@@ -448,7 +513,7 @@ make_numbered_plot <- function() {
   # Highlight drivers (top20 list)
   points(drivers_for_plot$PCA_strength, drivers_for_plot$Levene_F, pch = 23, cex = 1.2)
   legend("topleft", legend = c(paste0("DTW Cluster ", cl), "High PCA + High variance"),
-         pch = c(rep(16, length(cl)), 23), bty = "n")
+         pch = c(rep(16, length(cl)), 23), col = c(seq_along(cl), NA), bty = "n")
 }
 
 save_png(p_num_png, width = 2600, height = 1800, res = 300, expr = { make_numbered_plot() })
@@ -529,6 +594,10 @@ qmd <- c(
   paste0("- **script_path:** ", script_path),
   paste0("- **script_full:** ", script_full),
   paste0("- **output_dir:** ", output_dir),
+  paste0("- **repo_root:** ", git_meta$repo_root),
+  paste0("- **git_branch:** ", git_meta$git_branch),
+  paste0("- **git_commit:** ", git_meta$git_commit),
+  paste0("- **git_remote:** ", git_meta$git_remote),
   "",
   "### Input files (absolute paths)",
   "```",
@@ -550,7 +619,7 @@ qmd <- c(
   "",
   "- **PCA_strength** = max(|PC1_max|, |PC2_max|), capturing the strongest participation of a gene in either dominant coordination axis.",
   "- **Variance restructuring** is quantified by **Levene_F**, capturing developmental changes in inter-individual variance.",
-  "- **Candidate regulatory drivers** are genes satisfying simultaneous high PCA_strength, high variance restructuring, and (if available) high network centrality.",
+  "- **Candidate regulatory drivers** are genes satisfying simultaneous high PCA_strength, variance restructuring, and (if available) high network centrality.",
   "",
   "Thresholding used for visualization in the landscape plots:",
   "",
