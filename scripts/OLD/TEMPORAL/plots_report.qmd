@@ -1,0 +1,21 @@
+---
+title: "Plot report"
+format: html
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Run log
+
+Run log file: `plot_run_log_20260115_205648.txt`
+
+## Interactive plots
+
+### XY_Column_4_vs_delta_mean_20260115_205646.plotly.html
+
+```{=html}
+<iframe src="XY_Column_4_vs_delta_mean_20260115_205646.plotly.html" width="100%" height="650" style="border:0;"></iframe>
+```
+

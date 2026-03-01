@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# RStudio
+.Rhistory
+.Rhistory*
+.RData
+.Rproj.user/
+
+# Generated outputs
+outputs/
+plots/
+results/
+
+# Script generated summaries
+scripts/**/PDF/
+
+# Office / binary files
+*.docx
+*.pptx
+*.jmp
+
+# figures if generated
+*.png
+*.pdf
+
+# Quarto
+*.html
+*_files/
+*_cache/

@@ -1,0 +1,43 @@
+🔬 MULTI-SCRIPT ANALYSIS REPORT
+==============================
+
+Shared Functions:
+all_funcs
+           ts_stamp               stop2 resolve_script_path 
+                  4                   3                   2 
+
+Shared Variables:
+all_vars
+                   qc_lines                          df                           X                        days                       files                         idx 
+                         11                           6                           6                           4                           4                           4 
+                       keep                           p            script_full_note                 script_name                 script_path                    ts_stamp 
+                          4                           4                           4                           4                           4                           4 
+                         ca                 header_text                     missing                           s                       stop2                         sub 
+                          3                           3                           3                           3                           3                           3 
+                          Z               analysis_name                         con                      cosang                     day_col                         den 
+                          3                           2                           2                           2                           2                           2 
+                         ev fallback_used_for_reporting                    file_arg                 has_ggrepel                          hi                    idx_keep 
+                          2                           2                           2                           2                           2                           2 
+                       info                         inv              inventory_path       known_script_filename           known_script_stem                          lo 
+                          2                           2                           2                           2                           2                           2 
+                          m               manifest_path                met_nsv_path                      needed                          nn                         nsv 
+                          2                           2                           2                           2                           2                           2 
+                        num                  output_dir                outputs_root                 p_phase_unc                          p2                          p3 
+                          2                           2                           2                           2                           2                           2 
+                      paths                    pdf_path                    png_path                    qmd_path                         raw                        Rcur 
+                          2                           2                           2                           2                           2                           2 
+                        rel                  render_msg                   render_ok                         req         resolve_script_path                       Rprev 
+                          2                           2                           2                           2                           2                           2 
+                     run_id                      run_ok                 script_full                         seg                    sub_tbls            top_var_features 
+                          2                           2                           2                           2                           2                           2 
+               tx_tidy_path             use_uncertainty                          Xt 
+                          2                           2                           2 
+
+Shared Packages:
+all_pkgs
+ jsonlite     knitr     dplyr   ggplot2 rmarkdown     tidyr 
+        4         4         3         3         2         2 
+
+Suggested Execution Order:
+[1] "01_compute_NSV_trajectories.R"  "02_pub_plot_builder.R"          "03_lagged_structure_coupling.R" "Phase_Diagrams.R"              
+

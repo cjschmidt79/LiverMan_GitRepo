@@ -1,0 +1,15 @@
+timestamp: 20260115_205648
+csv_path: /Users/schmidtc/Library/CloudStorage/Dropbox/RSTUDIO/2025_LiverMan_1/scripts/OLD/TEMPORAL/untitled 14.csv
+plot_type: xy
+x_col: Column 4
+y_col: delta_mean
+xlab: Column 4
+ylab: delta_mean
+group_col: None
+add_identity: TRUE
+add_lm: FALSE
+group_palette: default
+line_color: blue
+output_pdf: /Users/schmidtc/Library/CloudStorage/Dropbox/RSTUDIO/2025_LiverMan_1/scripts/OLD/TEMPORAL/XY_Column_4_vs_delta_mean_20260115_205646.pdf
+output_png: /Users/schmidtc/Library/CloudStorage/Dropbox/RSTUDIO/2025_LiverMan_1/scripts/OLD/TEMPORAL/XY_Column_4_vs_delta_mean_20260115_205646.png
+output_plotly_html: /Users/schmidtc/Library/CloudStorage/Dropbox/RSTUDIO/2025_LiverMan_1/scripts/OLD/TEMPORAL/XY_Column_4_vs_delta_mean_20260115_205646.plotly.html

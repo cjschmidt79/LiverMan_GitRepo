@@ -1,0 +1,1007 @@
+#!/usr/bin/env Rscript
+# ======================================================================
+# Publication-Quality Plot Builder (Interactive; CSV-driven; RStudio-friendly)
+#
+# FIXES:
+#   1) Output directory is ALWAYS the same directory as the input CSV.
+#   2) Adds Plotly HTML export for each generated plot.
+#   3) Writes a QMD + renders HTML report (if Quarto available), otherwise
+#      writes a standalone index.html that embeds Plotly widgets.
+#   4) UX FIX for XY scatter: quick stats, blocks constant X/Y, suggests default Y.
+#   5) NEW: Implements plot types 1–3 (timecourse/summary/hist) so menu works.
+#
+# USAGE (RStudio):
+#   source("PublcationPLOTTER_V3.R", echo = TRUE)
+# ======================================================================
+
+# ---------------------------- Setup / Packages ----------------------------
+
+ts_stamp <- function() format(Sys.time(), "%Y%m%d_%H%M%S")
+stop2 <- function(...) stop(paste0(...), call. = FALSE)
+
+needed <- c("ggplot2", "dplyr", "tidyr", "scales", "patchwork", "rlang", "grid",
+            "plotly", "htmlwidgets")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
+  message("Installing missing packages: ", paste(missing, collapse = ", "))
+  install.packages(missing, repos = "https://cloud.r-project.org")
+}
+
+if (!requireNamespace("RColorBrewer", quietly = TRUE)) {
+  message("Optional package not found: RColorBrewer (group palettes will be default ggplot).")
+}
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(scales)
+  library(patchwork)
+  library(rlang)
+  library(grid)
+  library(plotly)
+  library(htmlwidgets)
+})
+
+has_ragg <- requireNamespace("ragg", quietly = TRUE)
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ---------------------------- House Theme ----------------------------
+
+theme_pub <- function(base_size = 11, base_family = "Helvetica", legend_pos = "right") {
+  theme_classic(base_size = base_size, base_family = base_family) +
+    theme(
+      axis.line = element_line(linewidth = 0.8),
+      axis.ticks = element_line(linewidth = 0.8),
+      axis.ticks.length = unit(2.2, "mm"),
+      plot.title = element_text(face = "bold", hjust = 0),
+      plot.subtitle = element_text(size = rel(0.95)),
+      plot.margin = margin(6, 10, 6, 6),
+      legend.position = legend_pos,
+      legend.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold"),
+      strip.background = element_blank()
+    )
+}
+
+# ---------------------------- Interactive Helpers ----------------------------
+
+choose_csv <- function() {
+  if (interactive()) {
+    message("Choose CSV file...")
+    return(file.choose())
+  }
+  stop2("Non-interactive session. Run interactively or provide a CSV path in code.")
+}
+
+show_cols <- function(df) {
+  cols <- colnames(df)
+  for (i in seq_along(cols)) cat(sprintf("  [%d] %s\n", i, cols[i]))
+  invisible(cols)
+}
+
+col_quick_stats <- function(df) {
+  nm <- names(df)
+  cat("\nColumn diagnostics (type / n_unique / numeric range if numeric):\n")
+  for (i in seq_along(nm)) {
+    x <- df[[nm[i]]]
+    cls <- class(x)[1]
+    nunq <- length(unique(x[!is.na(x)]))
+    msg <- sprintf("  [%d] %-25s | %-10s | n_unique=%-6d", i, nm[i], cls, nunq)
+    if (is.numeric(x)) {
+      rng <- range(x, na.rm = TRUE)
+      msg <- paste0(msg, sprintf(" | range=[%s, %s]", format(rng[1]), format(rng[2])))
+    }
+    cat(msg, "\n", sep = "")
+  }
+  invisible(TRUE)
+}
+
+choose_column <- function(df, prompt, show_stats = TRUE) {
+  cat("\n", prompt, "\n", sep = "")
+  if (show_stats) col_quick_stats(df) else show_cols(df)
+  cols <- colnames(df)
+  idx <- suppressWarnings(as.integer(readline("Enter column number: ")))
+  if (is.na(idx) || idx < 1 || idx > length(cols)) stop2("Invalid column selection.")
+  cols[idx]
+}
+
+choose_optional_column <- function(df, prompt, show_stats = TRUE) {
+  cat("\n", prompt, "\n", sep = "")
+  cat("  [0] None\n")
+  if (show_stats) col_quick_stats(df) else show_cols(df)
+  cols <- colnames(df)
+  idx <- suppressWarnings(as.integer(readline("Enter column number (0 for none): ")))
+  if (is.na(idx) || idx < 0 || idx > length(cols)) stop2("Invalid column selection.")
+  if (idx == 0) return(NULL)
+  cols[idx]
+}
+
+choose_plot_type <- function() {
+  cat("\nChoose plot type:\n")
+  cat("  [1] Time course (line + interval ribbon; optional raw points)\n")
+  cat("  [2] Summary (point+interval or bar+interval)\n")
+  cat("  [3] Histogram (optional facet; optional mean/CI lines)\n")
+  cat("  [4] PCA (scores; choose numeric feature columns)\n")
+  cat("  [5] XY scatter (points; optional y=x line; optional regression)\n")
+  idx <- suppressWarnings(as.integer(readline("Enter number: ")))
+  if (is.na(idx) || !(idx %in% 1:5)) stop2("Invalid plot type selection.")
+  c("timecourse", "summary", "hist", "pca", "xy")[idx]
+}
+
+choose_yes_no <- function(prompt, default = "y") {
+  ans <- readline(paste0(prompt, " (y/n) [", default, "]: "))
+  if (ans == "") ans <- default
+  tolower(ans) == "y"
+}
+
+choose_numeric_columns <- function(df) {
+  num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  if (length(num_cols) < 2) stop2("Need ≥2 numeric columns for PCA. None found (or too few).")
+  cat("\nSelect PCA feature columns (comma-separated indices):\n")
+  for (i in seq_along(num_cols)) cat(sprintf("  [%d] %s\n", i, num_cols[i]))
+  idx <- readline("Enter indices (e.g., 1,3,5): ")
+  sel <- suppressWarnings(as.integer(strsplit(idx, ",")[[1]]))
+  if (any(is.na(sel)) || any(sel < 1) || any(sel > length(num_cols))) stop2("Invalid PCA column selection.")
+  num_cols[sel]
+}
+
+choose_color <- function(prompt = "Enter a color (name like 'black' or hex like '#1f77b4')", default = "black") {
+  ans <- readline(paste0(prompt, " [", default, "]: "))
+  if (ans == "") ans <- default
+  ans
+}
+
+choose_group_palette <- function(default = "default") {
+  cat("\nGroup color palette:\n")
+  cat("  [1] default (ggplot)\n")
+  cat("  [2] brewer Set1 (if RColorBrewer installed)\n")
+  cat("  [3] brewer Dark2 (if RColorBrewer installed)\n")
+  cat("  [4] grayscale\n")
+  idx <- suppressWarnings(as.integer(readline("Enter number [1]: ")))
+  if (is.na(idx) || !(idx %in% 1:4)) idx <- 1
+  c("default", "Set1", "Dark2", "grayscale")[idx]
+}
+
+infer_axis_label <- function(df, axis = c("x", "y"), fallback = NULL) {
+  axis <- match.arg(axis)
+  candidates <- if (axis == "x") {
+    c("xlab","x_lab","x_label","xlabel","Xlab","X_lab","X_label","XLabel")
+  } else {
+    c("ylab","y_lab","y_label","ylabel","Ylab","Y_lab","Y_label","YLabel")
+  }
+  hit <- intersect(candidates, names(df))
+  if (length(hit) > 0) {
+    v <- df[[hit[1]]]
+    v <- v[!is.na(v)]
+    v <- v[nchar(trimws(as.character(v))) > 0]
+    if (length(v) > 0) return(as.character(v[1]))
+  }
+  fallback
+}
+
+choose_axis_label <- function(prompt, default) {
+  ans <- readline(paste0(prompt, " [", default, "]: "))
+  if (ans == "") ans <- default
+  ans
+}
+
+safe_stem <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+
+# ---------------------------- Robust numeric coercion + checks ----------------------------
+
+coerce_numeric_if_reasonable <- function(vec) {
+  if (is.numeric(vec)) return(vec)
+  v0 <- as.character(vec)
+  v1 <- gsub(",", "", v0)
+  suppressWarnings(vn <- as.numeric(v1))
+  orig_na <- is.na(vec)
+  new_na <- is.na(vn) & !orig_na
+  if (length(vn) && mean(new_na) <= 0.05) return(vn)
+  vec
+}
+
+n_unique_non_na <- function(vec) length(unique(vec[!is.na(vec)]))
+
+require_not_constant <- function(df, colname, label = "column") {
+  v <- df[[colname]]
+  nunq <- n_unique_non_na(v)
+  if (nunq <= 1) {
+    stop2("Selected ", label, " '", colname, "' has n_unique=", nunq,
+          ". This will produce a flat (constant) line. Please choose a varying column.")
+  }
+  TRUE
+}
+
+suggest_default_y_for_xy <- function(df, x_col) {
+  num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  num_cols <- setdiff(num_cols, x_col)
+  if (!length(num_cols)) return(NULL)
+  for (c in num_cols) {
+    if (n_unique_non_na(df[[c]]) > 1) return(c)
+  }
+  NULL
+}
+
+# ---------------------------- Plot Constructors ----------------------------
+
+apply_group_palette <- function(p, palette, group_is_fill = FALSE) {
+  if (palette == "default") return(p)
+  if (palette %in% c("Set1", "Dark2")) {
+    if (!requireNamespace("RColorBrewer", quietly = TRUE)) return(p)
+    if (group_is_fill) return(p + scale_fill_brewer(palette = palette))
+    return(p + scale_color_brewer(palette = palette))
+  }
+  if (palette == "grayscale") {
+    if (group_is_fill) return(p + scale_fill_grey(start = 0.2, end = 0.8))
+    return(p + scale_color_grey(start = 0.2, end = 0.8))
+  }
+  p
+}
+
+plot_pca_scores <- function(df_raw, feature_cols, color_col = NULL, title = NULL, ellipse = TRUE,
+                            legend_pos = "right", group_palette = "default",
+                            xlab = NULL, ylab = NULL) {
+  X <- as.matrix(df_raw[, feature_cols, drop = FALSE])
+  ok <- apply(X, 2, function(z) all(is.finite(z)))
+  if (!all(ok)) {
+    bad <- feature_cols[!ok]
+    stop2("PCA columns contain non-finite values: ", paste(bad, collapse = ", "))
+  }
+  
+  pca <- prcomp(X, center = TRUE, scale. = TRUE)
+  scores <- as.data.frame(pca$x[, 1:2, drop = FALSE])
+  var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
+  colnames(scores) <- c("PC1", "PC2")
+  plot_df <- bind_cols(scores, df_raw)
+  
+  default_xlab <- paste0("PC1 (", percent(var_expl[1], accuracy = 0.1), ")")
+  default_ylab <- paste0("PC2 (", percent(var_expl[2], accuracy = 0.1), ")")
+  
+  xlab_use <- xlab %||% default_xlab
+  ylab_use <- ylab %||% default_ylab
+  
+  if (!is.null(color_col)) {
+    p <- ggplot(plot_df, aes(x = PC1, y = PC2, color = .data[[color_col]])) +
+      geom_point(size = 2.0, alpha = 0.90)
+    if (ellipse) p <- p + stat_ellipse(type = "t", level = 0.95, linewidth = 0.5, show.legend = FALSE)
+    p <- apply_group_palette(p, group_palette, group_is_fill = FALSE)
+  } else {
+    p <- ggplot(plot_df, aes(x = PC1, y = PC2)) +
+      geom_point(size = 2.0, alpha = 0.90)
+  }
+  
+  p +
+    labs(title = title %||% "PCA (scores)", x = xlab_use, y = ylab_use) +
+    theme_pub(legend_pos = legend_pos)
+}
+
+plot_xy_scatter <- function(df_raw, x_col, y_col, group_col = NULL,
+                            title = NULL, xlab = NULL, ylab = NULL,
+                            legend_pos = "right",
+                            add_identity = TRUE,
+                            add_lm = FALSE,
+                            point_alpha = 0.75,
+                            point_size = 2.0,
+                            line_color = "black",
+                            group_palette = "default") {
+  
+  if (!is.null(group_col)) {
+    p <- ggplot(df_raw, aes(x = .data[[x_col]], y = .data[[y_col]], color = .data[[group_col]])) +
+      geom_point(alpha = point_alpha, size = point_size)
+    p <- apply_group_palette(p, group_palette, group_is_fill = FALSE)
+  } else {
+    p <- ggplot(df_raw, aes(x = .data[[x_col]], y = .data[[y_col]])) +
+      geom_point(alpha = point_alpha, size = point_size, color = line_color)
+  }
+  
+  if (add_identity) {
+    p <- p + geom_abline(intercept = 0, slope = 1, linetype = "dashed", linewidth = 0.7)
+  }
+  
+  if (add_lm) {
+    if (!is.null(group_col)) {
+      p <- p + geom_smooth(method = "lm", se = FALSE, linewidth = 0.7)
+    } else {
+      p <- p + geom_smooth(method = "lm", se = FALSE, linewidth = 0.7, color = line_color)
+    }
+  }
+  
+  p +
+    labs(title = title %||% "XY scatter", x = xlab %||% x_col, y = ylab %||% y_col) +
+    theme_pub(legend_pos = legend_pos)
+}
+
+plot_timecourse <- function(df_raw, x_col, y_col,
+                            lo_col = NULL, hi_col = NULL,
+                            group_col = NULL, facet_col = NULL,
+                            show_points = TRUE,
+                            title = NULL, xlab = NULL, ylab = NULL,
+                            legend_pos = "right",
+                            line_size = 0.8, point_size = 1.8, point_alpha = 0.65,
+                            group_palette = "default") {
+  
+  aes_base <- aes(x = .data[[x_col]], y = .data[[y_col]])
+  if (!is.null(group_col)) aes_base <- modifyList(aes_base, aes(color = .data[[group_col]], fill = .data[[group_col]]))
+  
+  p <- ggplot(df_raw, aes_base)
+  
+  if (!is.null(lo_col) && !is.null(hi_col)) {
+    if (!is.null(group_col)) {
+      p <- p + geom_ribbon(aes(ymin = .data[[lo_col]], ymax = .data[[hi_col]]),
+                           alpha = 0.18, color = NA)
+    } else {
+      p <- p + geom_ribbon(aes(ymin = .data[[lo_col]], ymax = .data[[hi_col]]),
+                           alpha = 0.18, fill = "grey70", color = NA)
+    }
+  }
+  
+  p <- p + geom_line(linewidth = line_size)
+  
+  if (show_points) {
+    p <- p + geom_point(size = point_size, alpha = point_alpha)
+  }
+  
+  if (!is.null(group_col)) {
+    p <- apply_group_palette(p, group_palette, group_is_fill = FALSE)
+    # ribbon uses fill; keep consistent if palette supports it
+    p <- apply_group_palette(p, group_palette, group_is_fill = TRUE)
+  }
+  
+  if (!is.null(facet_col)) {
+    p <- p + facet_wrap(vars(.data[[facet_col]]), scales = "free_y")
+  }
+  
+  p + labs(title = title %||% "Time course", x = xlab %||% x_col, y = ylab %||% y_col) +
+    theme_pub(legend_pos = legend_pos)
+}
+
+plot_summary <- function(df_raw, x_col, y_col,
+                         lo_col = NULL, hi_col = NULL,
+                         group_col = NULL, facet_col = NULL,
+                         use_bar = FALSE,
+                         title = NULL, xlab = NULL, ylab = NULL,
+                         legend_pos = "right",
+                         point_size = 2.2, point_alpha = 0.9,
+                         group_palette = "default") {
+  
+  # Base aesthetics
+  if (!is.null(group_col)) {
+    p <- ggplot(df_raw, aes(x = .data[[x_col]], y = .data[[y_col]], color = .data[[group_col]]))
+  } else {
+    p <- ggplot(df_raw, aes(x = .data[[x_col]], y = .data[[y_col]]))
+  }
+  
+  # Optional intervals
+  if (!is.null(lo_col) && !is.null(hi_col)) {
+    if (!is.null(group_col)) {
+      p <- p + geom_errorbar(aes(ymin = .data[[lo_col]], ymax = .data[[hi_col]]),
+                             width = 0.15, linewidth = 0.6, alpha = 0.9,
+                             position = position_dodge(width = if (use_bar) 0.75 else 0.35))
+    } else {
+      p <- p + geom_errorbar(aes(ymin = .data[[lo_col]], ymax = .data[[hi_col]]),
+                             width = 0.15, linewidth = 0.6, alpha = 0.9)
+    }
+  }
+  
+  # Bars or points
+  if (use_bar) {
+    if (!is.null(group_col)) {
+      p <- ggplot(df_raw, aes(x = .data[[x_col]], y = .data[[y_col]], fill = .data[[group_col]])) +
+        geom_col(position = position_dodge(width = 0.75), width = 0.70, alpha = 0.92)
+      if (!is.null(lo_col) && !is.null(hi_col)) {
+        p <- p + geom_errorbar(aes(ymin = .data[[lo_col]], ymax = .data[[hi_col]]),
+                               position = position_dodge(width = 0.75), width = 0.20, linewidth = 0.6)
+      }
+      p <- apply_group_palette(p, group_palette, group_is_fill = TRUE)
+    } else {
+      p <- p + geom_col(width = 0.70, alpha = 0.92)
+    }
+  } else {
+    if (!is.null(group_col)) {
+      p <- p + geom_point(size = point_size, alpha = point_alpha,
+                          position = position_dodge(width = 0.35))
+      p <- apply_group_palette(p, group_palette, group_is_fill = FALSE)
+    } else {
+      p <- p + geom_point(size = point_size, alpha = point_alpha)
+    }
+  }
+  
+  if (!is.null(facet_col)) {
+    p <- p + facet_wrap(vars(.data[[facet_col]]), scales = "free_y")
+  }
+  
+  p + labs(title = title %||% "Summary", x = xlab %||% x_col, y = ylab %||% y_col) +
+    theme_pub(legend_pos = legend_pos)
+}
+
+plot_hist <- function(df_raw, value_col,
+                      group_col = NULL, facet_col = NULL,
+                      bins = 30,
+                      show_mean_line = FALSE,
+                      show_ci_lines = FALSE,
+                      title = NULL, xlab = NULL, ylab = "Count",
+                      legend_pos = "right",
+                      group_palette = "default") {
+  
+  if (!is.null(group_col)) {
+    p <- ggplot(df_raw, aes(x = .data[[value_col]], fill = .data[[group_col]])) +
+      geom_histogram(bins = bins, alpha = 0.55, color = "white", linewidth = 0.2, position = "identity")
+    p <- apply_group_palette(p, group_palette, group_is_fill = TRUE)
+  } else {
+    p <- ggplot(df_raw, aes(x = .data[[value_col]])) +
+      geom_histogram(bins = bins, alpha = 0.9, color = "white", linewidth = 0.2)
+  }
+  
+  if (!is.null(facet_col)) {
+    p <- p + facet_wrap(vars(.data[[facet_col]]), scales = "free_y")
+  }
+  
+  # Optional mean/CI lines (computed within facet/group in a simple way)
+  if (show_mean_line || show_ci_lines) {
+    df_tmp <- df_raw
+    if (!is.null(group_col)) {
+      stats <- df_tmp %>%
+        group_by(.data[[group_col]] %||% NULL, .data[[facet_col]] %||% NULL) %>%
+        summarise(
+          mu = mean(.data[[value_col]], na.rm = TRUE),
+          lo = quantile(.data[[value_col]], 0.025, na.rm = TRUE),
+          hi = quantile(.data[[value_col]], 0.975, na.rm = TRUE),
+          .groups = "drop"
+        )
+    } else if (!is.null(facet_col)) {
+      stats <- df_tmp %>%
+        group_by(.data[[facet_col]]) %>%
+        summarise(
+          mu = mean(.data[[value_col]], na.rm = TRUE),
+          lo = quantile(.data[[value_col]], 0.025, na.rm = TRUE),
+          hi = quantile(.data[[value_col]], 0.975, na.rm = TRUE),
+          .groups = "drop"
+        )
+    } else {
+      stats <- data.frame(
+        mu = mean(df_tmp[[value_col]], na.rm = TRUE),
+        lo = as.numeric(quantile(df_tmp[[value_col]], 0.025, na.rm = TRUE)),
+        hi = as.numeric(quantile(df_tmp[[value_col]], 0.975, na.rm = TRUE))
+      )
+    }
+    
+    if (show_mean_line) {
+      p <- p + geom_vline(data = stats, aes(xintercept = mu),
+                          linetype = "solid", linewidth = 0.7, alpha = 0.85, inherit.aes = FALSE)
+    }
+    if (show_ci_lines) {
+      p <- p + geom_vline(data = stats, aes(xintercept = lo),
+                          linetype = "dashed", linewidth = 0.6, alpha = 0.85, inherit.aes = FALSE) +
+        geom_vline(data = stats, aes(xintercept = hi),
+                   linetype = "dashed", linewidth = 0.6, alpha = 0.85, inherit.aes = FALSE)
+    }
+  }
+  
+  p + labs(title = title %||% "Histogram", x = xlab %||% value_col, y = ylab) +
+    theme_pub(legend_pos = legend_pos)
+}
+
+# ---------------------------- Export + Logging ----------------------------
+
+save_pub <- function(p, out_dir, stem, width = 6.5, height = 4.0) {
+  pdf_path <- file.path(out_dir, paste0(stem, ".pdf"))
+  png_path <- file.path(out_dir, paste0(stem, ".png"))
+  
+  # Use cairo_pdf if available; fallback to pdf device
+  if (capabilities("cairo")) {
+    ggsave(pdf_path, p, width = width, height = height, units = "in", device = cairo_pdf)
+  } else {
+    ggsave(pdf_path, p, width = width, height = height, units = "in")
+  }
+  
+  if (has_ragg) {
+    ggsave(png_path, p, width = width, height = height, units = "in", dpi = 600, device = ragg::agg_png)
+  } else {
+    ggsave(png_path, p, width = width, height = height, units = "in", dpi = 600)
+  }
+  
+  list(pdf = pdf_path, png = png_path)
+}
+
+save_plotly_html <- function(p, out_dir, stem, width_in = 6.5, height_in = 4.0) {
+  html_path <- file.path(out_dir, paste0(stem, ".plotly.html"))
+  gg <- plotly::ggplotly(p)
+  w_px <- as.integer(width_in * 96)
+  h_px <- as.integer(height_in * 96)
+  gg <- plotly::ggplotly(p, width = w_px, height = h_px)
+    htmlwidgets::saveWidget(gg, file = html_path, selfcontained = TRUE)
+  html_path
+}
+
+write_run_log <- function(out_dir, log_list) {
+  log_path <- file.path(out_dir, paste0("plot_run_log_", ts_stamp(), ".txt"))
+  lines <- unlist(Map(function(k, v) paste0(k, ": ", v), names(log_list), log_list))
+  writeLines(lines, con = log_path)
+  log_path
+}
+
+write_quarto_report <- function(out_dir, title, plotly_files, log_path = NULL) {
+  qmd_path <- file.path(out_dir, "plots_report.qmd")
+  html_out <- file.path(out_dir, "plots_report.html")
+  
+  blocks <- c(
+    "---",
+    paste0('title: "', gsub('"', '\\"', title), '"'),
+    "format: html",
+    "execute:",
+    "  echo: false",
+    "  warning: false",
+    "  message: false",
+    "---",
+    ""
+  )
+  
+  if (!is.null(log_path) && file.exists(log_path)) {
+    blocks <- c(blocks, "## Run log", "", paste0("Run log file: `", basename(log_path), "`"), "")
+  }
+  
+  blocks <- c(blocks, "## Interactive plots", "")
+  
+  for (f in plotly_files) {
+    blocks <- c(
+      blocks,
+      paste0("### ", basename(f)),
+      "",
+      paste0("```{=html}\n<iframe src=\"", basename(f),
+             "\" width=\"100%\" height=\"650\" style=\"border:0;\"></iframe>\n```"),
+      ""
+    )
+  }
+  
+  writeLines(blocks, qmd_path)
+  
+  qbin <- Sys.which("quarto")
+  if (nzchar(qbin)) {
+    old <- getwd()
+    on.exit(setwd(old), add = TRUE)
+    setwd(out_dir)
+    system2(qbin, args = c("render", basename(qmd_path), "--to", "html"), stdout = TRUE, stderr = TRUE)
+    if (file.exists(html_out)) return(list(qmd = qmd_path, html = html_out, mode = "quarto"))
+  }
+  
+  idx_path <- file.path(out_dir, "plots_index.html")
+  body <- c(
+    "<!doctype html>",
+    "<html><head><meta charset='utf-8'>",
+    paste0("<title>", title, "</title>"),
+    "<style>body{font-family: Arial, sans-serif; margin: 24px;} iframe{margin: 12px 0;}</style>",
+    "</head><body>",
+    paste0("<h1>", title, "</h1>")
+  )
+  if (!is.null(log_path) && file.exists(log_path)) {
+    body <- c(body, paste0("<p>Run log file: <code>", basename(log_path), "</code></p>"))
+  }
+  for (f in plotly_files) {
+    body <- c(
+      body,
+      paste0("<h2>", basename(f), "</h2>"),
+      paste0("<iframe src='", basename(f), "' width='100%' height='650' style='border:0;'></iframe>")
+    )
+  }
+  body <- c(body, "</body></html>")
+  writeLines(body, idx_path)
+  
+  list(qmd = qmd_path, html = idx_path, mode = "fallback")
+}
+
+# ---------------------------- Main Interactive Driver ----------------------------
+
+cat("\n=== Publication Plot Builder (CSV-driven) ===\n")
+
+csv_path <- choose_csv()
+df <- read.csv(csv_path, stringsAsFactors = FALSE, check.names = FALSE)
+
+# OUTPUT DIRECTORY: same directory as input file
+out_dir <- dirname(csv_path)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("\nLoaded: ", csv_path, "\n", sep = "")
+cat("Output directory (fixed to input directory): ", out_dir, "\n", sep = "")
+cat("Rows: ", nrow(df), " | Columns: ", ncol(df), "\n", sep = "")
+col_quick_stats(df)
+
+cat("\nLegend position:\n  [1] right\n  [2] bottom\n  [3] none\n")
+lp <- suppressWarnings(as.integer(readline("Enter number [1]: ")))
+if (is.na(lp) || !(lp %in% 1:3)) lp <- 1
+legend_pos <- c("right", "bottom", "none")[lp]
+
+plot_type <- choose_plot_type()
+plotly_files <- character(0)
+
+# ---------------------------- TIME COURSE ----------------------------
+if (plot_type == "timecourse") {
+  
+  x_col <- choose_column(df, "Select X column (time; numeric or ordered):", show_stats = TRUE)
+  y_col <- choose_column(df, "Select Y column (numeric):", show_stats = TRUE)
+  
+  df[[x_col]] <- coerce_numeric_if_reasonable(df[[x_col]])
+  df[[y_col]] <- coerce_numeric_if_reasonable(df[[y_col]])
+  if (!is.numeric(df[[y_col]])) stop2("Y column '", y_col, "' is not numeric (or could not be safely coerced).")
+  require_not_constant(df, x_col, label = "X column")
+  require_not_constant(df, y_col, label = "Y column")
+  
+  has_ci <- choose_yes_no("Do you have interval columns (e.g., CI low/high or SE bands)?", default = "y")
+  lo_col <- hi_col <- NULL
+  if (has_ci) {
+    lo_col <- choose_optional_column(df, "Select LOWER interval column (optional):", show_stats = TRUE)
+    hi_col <- choose_optional_column(df, "Select UPPER interval column (optional):", show_stats = TRUE)
+    if (xor(is.null(lo_col), is.null(hi_col))) {
+      stop2("You selected only one interval column. Choose BOTH lower and upper, or choose none.")
+    }
+    if (!is.null(lo_col)) {
+      df[[lo_col]] <- coerce_numeric_if_reasonable(df[[lo_col]])
+      df[[hi_col]] <- coerce_numeric_if_reasonable(df[[hi_col]])
+      if (!is.numeric(df[[lo_col]]) || !is.numeric(df[[hi_col]])) stop2("Interval columns must be numeric.")
+    }
+  }
+  
+  group_col <- choose_optional_column(df, "Select GROUP column (color; optional):", show_stats = TRUE)
+  facet_col <- choose_optional_column(df, "Select FACET column (optional):", show_stats = TRUE)
+  show_points <- choose_yes_no("Show points on top of line?", default = "y")
+  
+  group_palette <- "default"
+  if (!is.null(group_col)) group_palette <- choose_group_palette()
+  
+  title <- readline("Plot title (optional): "); if (title == "") title <- NULL
+  xlab_default <- infer_axis_label(df, axis = "x", fallback = x_col)
+  ylab_default <- infer_axis_label(df, axis = "y", fallback = y_col)
+  xlab <- choose_axis_label("X-axis label", default = xlab_default)
+  ylab <- choose_axis_label("Y-axis label", default = ylab_default)
+  
+  width <- suppressWarnings(as.numeric(readline("Export width inches [6.5]: "))); if (!is.finite(width) || width <= 0) width <- 6.5
+  height <- suppressWarnings(as.numeric(readline("Export height inches [4.0]: "))); if (!is.finite(height) || height <= 0) height <- 4.0
+  
+  p <- plot_timecourse(
+    df_raw = df,
+    x_col = x_col, y_col = y_col,
+    lo_col = lo_col, hi_col = hi_col,
+    group_col = group_col, facet_col = facet_col,
+    show_points = show_points,
+    title = title, xlab = xlab, ylab = ylab,
+    legend_pos = legend_pos,
+    group_palette = group_palette
+  )
+  
+  print(p)
+  stem <- paste0("TIMECOURSE_", safe_stem(y_col), "_by_", safe_stem(x_col), "_", ts_stamp())
+  paths <- save_pub(p, out_dir, stem, width = width, height = height)
+  htmlp <- save_plotly_html(p, out_dir, stem, width_in = width, height_in = height)
+  plotly_files <- c(plotly_files, htmlp)
+  
+  cat("\nSaved:\n  ", paths$pdf, "\n  ", paths$png, "\n  ", htmlp, "\n", sep = "")
+  
+  log_path <- write_run_log(out_dir, list(
+    timestamp = ts_stamp(),
+    csv_path = csv_path,
+    plot_type = plot_type,
+    x_col = x_col,
+    y_col = y_col,
+    lo_col = lo_col %||% "None",
+    hi_col = hi_col %||% "None",
+    group_col = group_col %||% "None",
+    facet_col = facet_col %||% "None",
+    show_points = show_points,
+    group_palette = group_palette,
+    xlab = xlab, ylab = ylab,
+    output_pdf = paths$pdf,
+    output_png = paths$png,
+    output_plotly_html = htmlp
+  ))
+  
+  rep <- write_quarto_report(out_dir, title = "Plot report", plotly_files = plotly_files, log_path = log_path)
+  cat("Report written: ", rep$html, " (mode=", rep$mode, ")\n", sep = "")
+  cat("\nDone.\n")
+  
+  # ---------------------------- SUMMARY ----------------------------
+} else if (plot_type == "summary") {
+  
+  x_col <- choose_column(df, "Select X column (categories or time):", show_stats = TRUE)
+  y_col <- choose_column(df, "Select Y column (numeric summary):", show_stats = TRUE)
+  
+  df[[y_col]] <- coerce_numeric_if_reasonable(df[[y_col]])
+  if (!is.numeric(df[[y_col]])) stop2("Y column '", y_col, "' is not numeric (or could not be safely coerced).")
+  require_not_constant(df, y_col, label = "Y column")
+  
+  has_ci <- choose_yes_no("Do you have interval columns (e.g., CI low/high)?", default = "y")
+  lo_col <- hi_col <- NULL
+  if (has_ci) {
+    lo_col <- choose_optional_column(df, "Select LOWER interval column (optional):", show_stats = TRUE)
+    hi_col <- choose_optional_column(df, "Select UPPER interval column (optional):", show_stats = TRUE)
+    if (xor(is.null(lo_col), is.null(hi_col))) stop2("Choose BOTH lower and upper, or choose none.")
+    if (!is.null(lo_col)) {
+      df[[lo_col]] <- coerce_numeric_if_reasonable(df[[lo_col]])
+      df[[hi_col]] <- coerce_numeric_if_reasonable(df[[hi_col]])
+      if (!is.numeric(df[[lo_col]]) || !is.numeric(df[[hi_col]])) stop2("Interval columns must be numeric.")
+    }
+  }
+  
+  group_col <- choose_optional_column(df, "Select GROUP column (optional):", show_stats = TRUE)
+  facet_col <- choose_optional_column(df, "Select FACET column (optional):", show_stats = TRUE)
+  use_bar <- choose_yes_no("Use BAR plot (otherwise points)?", default = "n")
+  
+  group_palette <- "default"
+  if (!is.null(group_col)) group_palette <- choose_group_palette()
+  
+  title <- readline("Plot title (optional): "); if (title == "") title <- NULL
+  xlab_default <- infer_axis_label(df, axis = "x", fallback = x_col)
+  ylab_default <- infer_axis_label(df, axis = "y", fallback = y_col)
+  xlab <- choose_axis_label("X-axis label", default = xlab_default)
+  ylab <- choose_axis_label("Y-axis label", default = ylab_default)
+  
+  width <- suppressWarnings(as.numeric(readline("Export width inches [6.5]: "))); if (!is.finite(width) || width <= 0) width <- 6.5
+  height <- suppressWarnings(as.numeric(readline("Export height inches [4.0]: "))); if (!is.finite(height) || height <= 0) height <- 4.0
+  
+  p <- plot_summary(
+    df_raw = df,
+    x_col = x_col, y_col = y_col,
+    lo_col = lo_col, hi_col = hi_col,
+    group_col = group_col, facet_col = facet_col,
+    use_bar = use_bar,
+    title = title, xlab = xlab, ylab = ylab,
+    legend_pos = legend_pos,
+    group_palette = group_palette
+  )
+  
+  print(p)
+  stem <- paste0("SUMMARY_", safe_stem(y_col), "_by_", safe_stem(x_col), "_", ts_stamp())
+  paths <- save_pub(p, out_dir, stem, width = width, height = height)
+  htmlp <- save_plotly_html(p, out_dir, stem, width_in = width, height_in = height)
+  plotly_files <- c(plotly_files, htmlp)
+  
+  cat("\nSaved:\n  ", paths$pdf, "\n  ", paths$png, "\n  ", htmlp, "\n", sep = "")
+  
+  log_path <- write_run_log(out_dir, list(
+    timestamp = ts_stamp(),
+    csv_path = csv_path,
+    plot_type = plot_type,
+    x_col = x_col,
+    y_col = y_col,
+    lo_col = lo_col %||% "None",
+    hi_col = hi_col %||% "None",
+    group_col = group_col %||% "None",
+    facet_col = facet_col %||% "None",
+    use_bar = use_bar,
+    group_palette = group_palette,
+    xlab = xlab, ylab = ylab,
+    output_pdf = paths$pdf,
+    output_png = paths$png,
+    output_plotly_html = htmlp
+  ))
+  
+  rep <- write_quarto_report(out_dir, title = "Plot report", plotly_files = plotly_files, log_path = log_path)
+  cat("Report written: ", rep$html, " (mode=", rep$mode, ")\n", sep = "")
+  cat("\nDone.\n")
+  
+  # ---------------------------- HISTOGRAM ----------------------------
+} else if (plot_type == "hist") {
+  
+  value_col <- choose_column(df, "Select VALUE column for histogram (numeric):", show_stats = TRUE)
+  df[[value_col]] <- coerce_numeric_if_reasonable(df[[value_col]])
+  if (!is.numeric(df[[value_col]])) stop2("Histogram VALUE column must be numeric.")
+  
+  group_col <- choose_optional_column(df, "Select GROUP column (fill; optional):", show_stats = TRUE)
+  facet_col <- choose_optional_column(df, "Select FACET column (optional):", show_stats = TRUE)
+  
+  bins <- suppressWarnings(as.integer(readline("Number of bins [30]: ")))
+  if (is.na(bins) || bins < 5) bins <- 30
+  
+  show_mean <- choose_yes_no("Draw vertical MEAN line(s)?", default = "n")
+  show_ci <- choose_yes_no("Draw vertical 95% interval lines (2.5% / 97.5%)?", default = "n")
+  
+  group_palette <- "default"
+  if (!is.null(group_col)) group_palette <- choose_group_palette()
+  
+  title <- readline("Plot title (optional): "); if (title == "") title <- NULL
+  xlab_default <- infer_axis_label(df, axis = "x", fallback = value_col)
+  xlab <- choose_axis_label("X-axis label", default = xlab_default)
+  
+  width <- suppressWarnings(as.numeric(readline("Export width inches [6.5]: "))); if (!is.finite(width) || width <= 0) width <- 6.5
+  height <- suppressWarnings(as.numeric(readline("Export height inches [4.0]: "))); if (!is.finite(height) || height <= 0) height <- 4.0
+  
+  p <- plot_hist(
+    df_raw = df,
+    value_col = value_col,
+    group_col = group_col,
+    facet_col = facet_col,
+    bins = bins,
+    show_mean_line = show_mean,
+    show_ci_lines = show_ci,
+    title = title, xlab = xlab,
+    legend_pos = legend_pos,
+    group_palette = group_palette
+  )
+  
+  print(p)
+  stem <- paste0("HIST_", safe_stem(value_col), "_", ts_stamp())
+  paths <- save_pub(p, out_dir, stem, width = width, height = height)
+  htmlp <- save_plotly_html(p, out_dir, stem, width_in = width, height_in = height)
+  plotly_files <- c(plotly_files, htmlp)
+  
+  cat("\nSaved:\n  ", paths$pdf, "\n  ", paths$png, "\n  ", htmlp, "\n", sep = "")
+  
+  log_path <- write_run_log(out_dir, list(
+    timestamp = ts_stamp(),
+    csv_path = csv_path,
+    plot_type = plot_type,
+    value_col = value_col,
+    group_col = group_col %||% "None",
+    facet_col = facet_col %||% "None",
+    bins = bins,
+    show_mean = show_mean,
+    show_ci = show_ci,
+    group_palette = group_palette,
+    xlab = xlab,
+    output_pdf = paths$pdf,
+    output_png = paths$png,
+    output_plotly_html = htmlp
+  ))
+  
+  rep <- write_quarto_report(out_dir, title = "Plot report", plotly_files = plotly_files, log_path = log_path)
+  cat("Report written: ", rep$html, " (mode=", rep$mode, ")\n", sep = "")
+  cat("\nDone.\n")
+  
+  # ---------------------------- PCA ----------------------------
+} else if (plot_type == "pca") {
+  
+  feature_cols <- choose_numeric_columns(df)
+  color_col <- choose_optional_column(df, "Select COLOR column for PCA points (optional; e.g., Day, Line):")
+  ellipse <- FALSE
+  group_palette <- "default"
+  if (!is.null(color_col)) {
+    ellipse <- choose_yes_no("Add 95% ellipse per group (color column)?", default = "y")
+    group_palette <- choose_group_palette()
+  }
+  
+  title <- readline("Plot title (optional): "); if (title == "") title <- NULL
+  
+  xlab_default <- infer_axis_label(df, axis = "x", fallback = "PC1")
+  ylab_default <- infer_axis_label(df, axis = "y", fallback = "PC2")
+  xlab <- choose_axis_label("X-axis label (PCA)", default = xlab_default)
+  ylab <- choose_axis_label("Y-axis label (PCA)", default = ylab_default)
+  
+  width <- suppressWarnings(as.numeric(readline("Export width inches [6.0]: ")))
+  if (!is.finite(width) || width <= 0) width <- 6.0
+  height <- suppressWarnings(as.numeric(readline("Export height inches [5.0]: ")))
+  if (!is.finite(height) || height <= 0) height <- 5.0
+  
+  p <- plot_pca_scores(
+    df_raw = df,
+    feature_cols = feature_cols,
+    color_col = color_col,
+    title = title,
+    ellipse = ellipse,
+    legend_pos = legend_pos,
+    group_palette = group_palette,
+    xlab = xlab,
+    ylab = ylab
+  )
+  
+  print(p)
+  stem <- paste0("PCA_", ts_stamp())
+  paths <- save_pub(p, out_dir, stem, width = width, height = height)
+  htmlp <- save_plotly_html(p, out_dir, stem, width_in = width, height_in = height)
+  plotly_files <- c(plotly_files, htmlp)
+  
+  cat("\nSaved:\n  ", paths$pdf, "\n  ", paths$png, "\n  ", htmlp, "\n", sep = "")
+  
+  log_path <- write_run_log(out_dir, list(
+    timestamp = ts_stamp(),
+    csv_path = csv_path,
+    plot_type = plot_type,
+    feature_cols = paste(feature_cols, collapse = ", "),
+    color_col = color_col %||% "None",
+    ellipse = ellipse,
+    group_palette = group_palette,
+    xlab = xlab,
+    ylab = ylab,
+    output_pdf = paths$pdf,
+    output_png = paths$png,
+    output_plotly_html = htmlp
+  ))
+  
+  rep <- write_quarto_report(out_dir, title = "Plot report", plotly_files = plotly_files, log_path = log_path)
+  cat("Report written: ", rep$html, " (mode=", rep$mode, ")\n", sep = "")
+  cat("\nDone.\n")
+  
+  # ---------------------------- XY SCATTER ----------------------------
+} else if (plot_type == "xy") {
+  
+  x_col <- choose_column(df, "Select X column:", show_stats = TRUE)
+  df[[x_col]] <- coerce_numeric_if_reasonable(df[[x_col]])
+  if (!is.numeric(df[[x_col]])) stop2("X column '", x_col, "' is not numeric (or could not be safely coerced).")
+  require_not_constant(df, x_col, label = "X column")
+  
+  suggested_y <- suggest_default_y_for_xy(df, x_col = x_col)
+  if (!is.null(suggested_y)) {
+    cat("\nSuggested Y (first non-constant numeric column excluding X): ", suggested_y, "\n", sep = "")
+    use_suggest <- choose_yes_no(paste0("Use suggested Y = '", suggested_y, "'?"), default = "y")
+    if (use_suggest) y_col <- suggested_y else y_col <- choose_column(df, "Select Y column:", show_stats = TRUE)
+  } else {
+    y_col <- choose_column(df, "Select Y column:", show_stats = TRUE)
+  }
+  
+  df[[y_col]] <- coerce_numeric_if_reasonable(df[[y_col]])
+  if (!is.numeric(df[[y_col]])) stop2("Y column '", y_col, "' is not numeric (or could not be safely coerced).")
+  require_not_constant(df, y_col, label = "Y column")
+  
+  group_col <- choose_optional_column(df, "Select GROUP (color) column (optional):", show_stats = TRUE)
+  
+  add_identity <- choose_yes_no("Add y=x reference line?", default = "n")
+  add_lm <- choose_yes_no("Add linear regression line?", default = "n")
+  
+  line_color <- "black"
+  group_palette <- "default"
+  if (is.null(group_col)) {
+    line_color <- choose_color("Enter point/regression color (single series)", default = "black")
+  } else {
+    group_palette <- choose_group_palette()
+  }
+  
+  title <- readline("Plot title (optional): "); if (title == "") title <- NULL
+  
+  xlab_default <- infer_axis_label(df, axis = "x", fallback = x_col)
+  ylab_default <- infer_axis_label(df, axis = "y", fallback = y_col)
+  xlab <- choose_axis_label("X-axis label", default = xlab_default)
+  ylab <- choose_axis_label("Y-axis label", default = ylab_default)
+  
+  width <- suppressWarnings(as.numeric(readline("Export width inches [6.0]: ")))
+  if (!is.finite(width) || width <= 0) width <- 6.0
+  height <- suppressWarnings(as.numeric(readline("Export height inches [5.0]: ")))
+  if (!is.finite(height) || height <= 0) height <- 5.0
+  
+  p <- plot_xy_scatter(
+    df_raw = df,
+    x_col = x_col,
+    y_col = y_col,
+    group_col = group_col,
+    title = title,
+    xlab = xlab, ylab = ylab,
+    legend_pos = legend_pos,
+    add_identity = add_identity,
+    add_lm = add_lm,
+    line_color = line_color,
+    group_palette = group_palette
+  )
+  
+  print(p)
+  stem <- paste0("XY_", safe_stem(x_col), "_vs_", safe_stem(y_col), "_", ts_stamp())
+  paths <- save_pub(p, out_dir, stem, width = width, height = height)
+  htmlp <- save_plotly_html(p, out_dir, stem, width_in = width, height_in = height)
+  plotly_files <- c(plotly_files, htmlp)
+  
+  cat("\nSaved:\n  ", paths$pdf, "\n  ", paths$png, "\n  ", htmlp, "\n", sep = "")
+  
+  log_path <- write_run_log(out_dir, list(
+    timestamp = ts_stamp(),
+    csv_path = csv_path,
+    plot_type = plot_type,
+    x_col = x_col,
+    y_col = y_col,
+    xlab = xlab,
+    ylab = ylab,
+    group_col = group_col %||% "None",
+    add_identity = add_identity,
+    add_lm = add_lm,
+    group_palette = group_palette,
+    line_color = line_color,
+    output_pdf = paths$pdf,
+    output_png = paths$png,
+    output_plotly_html = htmlp
+  ))
+  
+  rep <- write_quarto_report(out_dir, title = "Plot report", plotly_files = plotly_files, log_path = log_path)
+  cat("Report written: ", rep$html, " (mode=", rep$mode, ")\n", sep = "")
+  cat("\nDone.\n")
+  
+} else {
+  # This should never happen because choose_plot_type() constrains options,
+  # but it prevents silent exits if code is modified later.
+  stop2("Plot type '", plot_type, "' is not recognized.")
+}
